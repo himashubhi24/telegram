@@ -24,30 +24,30 @@ PENDING_INPUT = {}
 def panel_rows():
     return [
         [
-            {"text": "Add Normal", "callback_data": "fsub:add:normal", "style": "success"},
-            {"text": "Add Request", "callback_data": "fsub:add:request", "style": "primary"},
+            {"text": "🟢 Add Normal", "callback_data": "fsub:add:normal", "style": "success"},
+            {"text": "🔵 Add Request", "callback_data": "fsub:add:request", "style": "primary"},
         ],
         [
-            {"text": "Remove", "callback_data": "fsub:remove", "style": "danger"},
-            {"text": "List", "callback_data": "fsub:list", "style": "primary"},
+            {"text": "🔴 Remove", "callback_data": "fsub:remove", "style": "danger"},
+            {"text": "🔵 List", "callback_data": "fsub:list", "style": "primary"},
         ],
         [
-            {"text": "Enable IDs", "callback_data": "fsub:enable", "style": "success"},
-            {"text": "Disable IDs", "callback_data": "fsub:disable", "style": "danger"},
+            {"text": "🟢 Enable IDs", "callback_data": "fsub:enable", "style": "success"},
+            {"text": "🔴 Disable IDs", "callback_data": "fsub:disable", "style": "danger"},
         ],
         [
             {
-                "text": "Gate OFF" if is_force_sub_globally_enabled() else "Gate ON",
+                "text": ("🔴 Gate OFF" if is_force_sub_globally_enabled() else "🟢 Gate ON"),
                 "callback_data": "fsub:toggle_global",
                 "style": "primary",
             },
             {
-                "text": "Link Flow OFF" if is_link_flow_enabled() else "Link Flow ON",
+                "text": ("🔴 Link Flow OFF" if is_link_flow_enabled() else "🟢 Link Flow ON"),
                 "callback_data": "fsub:toggle_link_flow",
                 "style": "primary",
             },
         ],
-        [{"text": "Close", "callback_data": "fsub:close", "style": "danger"}],
+        [{"text": "🔴 Close", "callback_data": "fsub:close", "style": "danger"}],
     ]
 
 

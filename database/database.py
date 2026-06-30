@@ -188,8 +188,8 @@ async def configure_channel_pair_schedule(
     interval = int(interval_minutes or current.get("interval_minutes") or 60)
     if selected_mode not in ("first", "latest"):
         raise ValueError("Invalid processing mode")
-    if interval not in (30, 60):
-        raise ValueError("Interval must be 30 or 60 minutes")
+    if interval < 30 or interval > 1440:
+        raise ValueError("Interval must be between 30 and 1440 minutes")
 
     update = {
         "$set": {

@@ -34,29 +34,30 @@ def admin_markup():
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Add Source", callback_data="admin_add_source"),
-                InlineKeyboardButton("Add Target", callback_data="admin_add_target"),
+                InlineKeyboardButton("🟢 Add Source", callback_data="admin_add_source"),
+                InlineKeyboardButton("🟢 Add Target", callback_data="admin_add_target"),
             ],
-            [InlineKeyboardButton("Remove Source/Target", callback_data="admin_remove_pair")],
-            [InlineKeyboardButton("Add Userbot Session", callback_data="admin_add_session")],
-            [InlineKeyboardButton("Userbot Status", callback_data="admin_userbot_status")],
-            [InlineKeyboardButton("Force Subscribe Panel", callback_data="admin_open_fsub")],
-            [InlineKeyboardButton("View Channel Pairs", callback_data="admin_pairs")],
+            [InlineKeyboardButton("🔴 Remove Source/Target", callback_data="admin_remove_pair")],
+            [InlineKeyboardButton("🟢 Add Userbot Session", callback_data="admin_add_session")],
+            [InlineKeyboardButton("🔵 Userbot Status", callback_data="admin_userbot_status")],
+            [InlineKeyboardButton("🔵 Force Subscribe Panel", callback_data="admin_open_fsub")],
+            [InlineKeyboardButton("🔵 View Channel Pairs", callback_data="admin_pairs")],
             [
-                InlineKeyboardButton("Start From First", callback_data="admin_start_first"),
-                InlineKeyboardButton("Start From Latest", callback_data="admin_start_latest"),
+                InlineKeyboardButton("🟢 Start From First", callback_data="admin_start_first"),
+                InlineKeyboardButton("🟢 Start From Latest", callback_data="admin_start_latest"),
             ],
             [
-                InlineKeyboardButton("Interval 30 Min", callback_data="admin_interval_30"),
-                InlineKeyboardButton("Interval 1 Hour", callback_data="admin_interval_60"),
+                InlineKeyboardButton("🟢 Interval 30 Min", callback_data="admin_interval_30"),
+                InlineKeyboardButton("🟢 Interval 1 Hour", callback_data="admin_interval_60"),
             ],
-            [InlineKeyboardButton("Set Custom Start Post", callback_data="admin_set_start_post")],
-            [InlineKeyboardButton("Live Repost Status", callback_data="admin_repost_status")],
-            [InlineKeyboardButton("Run Backfill Now", callback_data="admin_run_backfill")],
-            [InlineKeyboardButton("Statistics", callback_data="admin_stats")],
-            [InlineKeyboardButton("Link Flow Status", callback_data="admin_link_flow_status")],
-            [InlineKeyboardButton("Bot Settings", callback_data="admin_settings")],
-            [InlineKeyboardButton("Close", callback_data="close")],
+            [InlineKeyboardButton("🔵 Set Custom Start Post", callback_data="admin_set_start_post")],
+            [InlineKeyboardButton("🟢 Set Custom Interval", callback_data="admin_interval_custom")],
+            [InlineKeyboardButton("🔵 Live Repost Status", callback_data="admin_repost_status")],
+            [InlineKeyboardButton("🟢 Run Backfill Now", callback_data="admin_run_backfill")],
+            [InlineKeyboardButton("🔵 Statistics", callback_data="admin_stats")],
+            [InlineKeyboardButton("🔵 Link Flow Status", callback_data="admin_link_flow_status")],
+            [InlineKeyboardButton("🔵 Bot Settings", callback_data="admin_settings")],
+            [InlineKeyboardButton("🔴 Close", callback_data="close")],
         ]
     )
 
@@ -136,6 +137,14 @@ async def admin_callbacks(client: Client, query: CallbackQuery):
         await query.answer(f"Set {minutes} minute interval")
         await query.message.reply_text(
             "Send source and target IDs:\n<code>-100SOURCE -100TARGET</code>"
+        )
+        return
+    elif action == "admin_interval_custom":
+        PENDING_ADMIN_INPUT[user_id] = "interval_custom"
+        await query.answer("Set custom interval")
+        await query.message.reply_text(
+            "Send like this:\n<code>-100SOURCE -100TARGET HOURS</code>\n\n"
+            "Hours can be from <code>1</code> to <code>24</code>."
         )
         return
     elif action == "admin_set_start_post":
@@ -306,6 +315,30 @@ async def admin_pending_input(client: Client, message: Message):
             PENDING_ADMIN_INPUT.pop(user_id, None)
             await message.reply_text(
                 f"Posting interval set to <code>{minutes} minutes</code>.",
+                reply_markup=admin_markup(),
+            )
+            return
+        if action == "interval_custom":
+            parts = text.split()
+            if len(parts) != 3:
+                await message.reply_text(
+                    "Send exactly like this:\n<code>-100SOURCE -100TARGET HOURS</code>"
+                )
+                return
+            source, target = map(int, parts[:2])
+            hours = int(parts[2])
+            if hours < 1 or hours > 24:
+                await message.reply_text("Hours must be between <code>1</code> and <code>24</code>.")
+                return
+            minutes = hours * 60
+            await configure_channel_pair_schedule(
+                source, target,
+                interval_minutes=minutes,
+                updated_by=user_id,
+            )
+            PENDING_ADMIN_INPUT.pop(user_id, None)
+            await message.reply_text(
+                f"Posting interval set to <code>{hours} hour(s)</code>.",
                 reply_markup=admin_markup(),
             )
             return
