@@ -6,8 +6,17 @@ from bot import Bot
 from config import ADMINS
 from helper_func import encode, get_message_id
 
+# --- safe rollout link generator runtime fallback ---
+async def _ensure_runtime_attrs(client):
+    if not getattr(client, "db_channel", None):
+        raise RuntimeError("DB channel is not ready yet. Try again in a few seconds.")
+    if not getattr(client, "username", None):
+        me = await client.get_me()
+        client.username = me.username
+
 @Bot.on_message(filters.private & filters.user(ADMINS) & filters.command('batch'))
 async def batch(client: Client, message: Message):
+    await _ensure_runtime_attrs(client)
     while True:
         try:
             first_message = await client.ask(text = "Forward the First Message from DB Channel (with Quotes)..\n\nor Send the DB Channel Post Link", chat_id = message.from_user.id, filters=(filters.forwarded | (filters.text & ~filters.forwarded)), timeout=60)
@@ -42,6 +51,7 @@ async def batch(client: Client, message: Message):
 
 @Bot.on_message(filters.private & filters.user(ADMINS) & filters.command('genlink'))
 async def link_generator(client: Client, message: Message):
+    await _ensure_runtime_attrs(client)
     while True:
         try:
             channel_message = await client.ask(text = "Forward Message from the DB Channel (with Quotes)..\nor Send the DB Channel Post link", chat_id = message.from_user.id, filters=(filters.forwarded | (filters.text & ~filters.forwarded)), timeout=60)
