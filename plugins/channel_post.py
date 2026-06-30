@@ -9,9 +9,19 @@ from bot import Bot
 from config import ADMINS, CHANNEL_ID, DISABLE_CHANNEL_BUTTON
 from helper_func import encode
 
+# --- safe rollout runtime attribute fallback ---
+async def _ensure_runtime_attrs(client):
+    if not getattr(client, "db_channel", None):
+        client.db_channel = await client.get_chat(CHANNEL_ID)
+    if not getattr(client, "username", None):
+        me = await client.get_me()
+        client.username = me.username
+
+
 @Bot.on_message(filters.private & filters.user(ADMINS) & ~filters.command(['start','users','broadcast','batch','genlink','stats']))
 async def channel_post(client: Client, message: Message):
     reply_text = await message.reply_text("Please Wait...!", quote = True)
+    await _ensure_runtime_attrs(client)
     try:
         post_message = await message.copy(chat_id = client.db_channel.id, disable_notification=True)
     except FloodWait as e:
@@ -35,6 +45,8 @@ async def channel_post(client: Client, message: Message):
 
 @Bot.on_message(filters.channel & filters.incoming & filters.chat(CHANNEL_ID))
 async def new_post(client: Client, message: Message):
+
+    await _ensure_runtime_attrs(client)
 
     if DISABLE_CHANNEL_BUTTON:
         return

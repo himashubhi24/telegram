@@ -85,3 +85,54 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 def LOGGER(name: str) -> logging.Logger:
     return logging.getLogger(name)
    
+
+# --- safe rollout auto repost + force-sub extension ---
+def _safe_env_int(name, default=0):
+    value = os.environ.get(name, default)
+    if value in ("", None):
+        return 0
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return int(default)
+
+
+def _safe_env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).lower() in ("1", "true", "yes", "on")
+
+
+def _safe_env_int_list(name):
+    raw = os.environ.get(name, "") or ""
+    values = []
+    for item in raw.replace(",", " ").split():
+        try:
+            values.append(int(item))
+        except ValueError:
+            continue
+    return values
+
+
+SESSION_STRING = os.environ.get("SESSION_STRING", "")
+DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
+PROXY_URL = os.environ.get("PROXY_URL", "")
+VERIFY_TTL_SECONDS = _safe_env_int("VERIFY_TTL_SECONDS", 14400)
+
+FORCE_SUB_CHANNELS = []
+for _item in _safe_env_int_list("FORCE_SUB_CHANNELS"):
+    if _item and _item not in FORCE_SUB_CHANNELS:
+        FORCE_SUB_CHANNELS.append(_item)
+for _single in (globals().get("FORCE_SUB_CHANNEL", 0), globals().get("FORCE_SUB_CHANNEL2", 0)):
+    try:
+        _single = int(_single)
+    except Exception:
+        _single = 0
+    if _single and _single not in FORCE_SUB_CHANNELS:
+        FORCE_SUB_CHANNELS.append(_single)
+
+AUTO_REPOST_ENABLED = _safe_env_bool("AUTO_REPOST_ENABLED", bool(SESSION_STRING))
+DEEPLINK_TIMEOUT = _safe_env_int("DEEPLINK_TIMEOUT", 90)
+SOURCE_BOT_RATE_LIMIT = _safe_env_int("SOURCE_BOT_RATE_LIMIT", 5)
+SOURCE_BOT_RATE_WINDOW = _safe_env_int("SOURCE_BOT_RATE_WINDOW", 60)
