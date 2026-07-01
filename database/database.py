@@ -1,8 +1,10 @@
 #(c) CodeXBotz / Advanced File Share Bot
 
 from datetime import datetime, timedelta
+import base64
 from bson import ObjectId
 import pymongo
+import config
 
 from config import DB_URI, DB_NAME, VERIFY_TTL_SECONDS
 
@@ -130,7 +132,7 @@ async def get_batch(batch_id):
 
 
 async def add_channel_pair(source_channel, target_channel, added_by):
-    channels_col.update_one(
+    result = channels_col.update_one(
         {"source_channel": int(source_channel), "target_channel": int(target_channel)},
         {
             "$set": {"active": True, "updated_at": datetime.utcnow()},
@@ -144,20 +146,22 @@ async def add_channel_pair(source_channel, target_channel, added_by):
         },
         upsert=True,
     )
+    return bool(result.acknowledged)
 
 
 async def remove_channel_pair(source_channel, target_channel=None):
     query = {"source_channel": int(source_channel)}
     if target_channel is not None:
         query["target_channel"] = int(target_channel)
-    channels_col.delete_many(query)
+    return channels_col.delete_many(query).deleted_count
 
 
 async def set_channel_pair_active(source_channel, target_channel, active):
-    channels_col.update_one(
+    result = channels_col.update_one(
         {"source_channel": int(source_channel), "target_channel": int(target_channel)},
         {"$set": {"active": bool(active), "updated_at": datetime.utcnow()}},
     )
+    return result.matched_count
 
 
 async def set_channel_pair_start(source_channel, target_channel, start_message_id, updated_by=None):
@@ -292,7 +296,7 @@ async def mark_pair_skipped(pair_id, message_id, reason):
 
 
 async def add_force_sub_channel(channel_id, username=None):
-    force_sub_col.update_one(
+    result = force_sub_col.update_one(
         {"channel_id": int(channel_id)},
         {
             "$set": {"channel_username": username, "active": True},
@@ -300,10 +304,12 @@ async def add_force_sub_channel(channel_id, username=None):
         },
         upsert=True,
     )
+    return bool(result.acknowledged)
 
 
 async def remove_force_sub_channel(channel_id):
-    force_sub_col.update_one({"channel_id": int(channel_id)}, {"$set": {"active": False}})
+    result = force_sub_col.update_one({"channel_id": int(channel_id)}, {"$set": {"active": False}})
+    return result.matched_count
 
 
 async def list_force_sub_channels():
@@ -375,7 +381,65 @@ async def get_setting(key, default=None):
 
 
 async def get_userbot_session():
-    return await get_setting("session_string", None)
+    current_bot_id = _configured_bot_id()
+    if not current_bot_id:
+        return None
+    session = await get_setting(f"session_string:{current_bot_id}", None)
+    if not session:
+        return None
+    try:
+        padded = str(session) + ("=" * (-len(str(session)) % 4))
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+    except Exception:
+        return None
+    return str(session) if len(decoded) >= 250 else None
+
+
+def _configured_bot_id():
+    for name in ("TG_BOT_TOKEN", "BOT_TOKEN", "TOKEN"):
+        token = str(getattr(config, name, "") or "")
+        if ":" not in token:
+            continue
+        try:
+            return int(token.split(":", 1)[0])
+        except ValueError:
+            continue
+    return 0
+
+
+async def save_userbot_session(session, updated_by=None):
+    bot_id = _configured_bot_id()
+    if not bot_id:
+        raise RuntimeError("Current bot identity is unavailable")
+    await set_setting(f"session_string:{bot_id}", str(session), updated_by)
+    await set_setting(f"session_bot_id:{bot_id}", bot_id, updated_by)
+
+
+async def get_auto_repost_enabled():
+    bot_id = _configured_bot_id()
+    if not bot_id:
+        return False
+    value = await get_setting(f"auto_repost_enabled:{bot_id}", None)
+    if value is not None:
+        return bool(value)
+    if await get_userbot_session() and await get_setting("auto_repost_enabled", False):
+        return True
+    return False
+
+
+async def set_auto_repost_enabled(enabled, updated_by=None):
+    bot_id = _configured_bot_id()
+    if not bot_id:
+        raise RuntimeError("Current bot identity is unavailable")
+    await set_setting(f"auto_repost_enabled:{bot_id}", bool(enabled), updated_by)
+
+
+async def clear_userbot_session(updated_by=None):
+    bot_id = _configured_bot_id()
+    if not bot_id:
+        raise RuntimeError("Current bot identity is unavailable")
+    settings_col.delete_many({"setting_key": {"$in": [f"session_string:{bot_id}", f"session_bot_id:{bot_id}"]}})
+    await set_auto_repost_enabled(False, updated_by)
 
 
 async def get_bot_statistics():

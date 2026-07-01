@@ -17,6 +17,7 @@ except Exception as exc:
 async def main():
     bot = Bot()
     worker = AutoRepostWorker(bot) if AutoRepostWorker else None
+    bot.auto_repost_worker = worker
     await bot.start()
     if worker:
         await worker.start()

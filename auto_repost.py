@@ -31,6 +31,7 @@ from database.database import (
     get_deeplink_mapping,
     get_setting,
     get_userbot_session,
+    get_auto_repost_enabled,
     get_targets_for_source,
     mark_pair_processed,
     mark_pair_error,
@@ -146,6 +147,13 @@ def extract_channel_from_url(url):
     if not url:
         return None
     parsed = urlparse(url)
+    if parsed.scheme == "tg":
+        query = parse_qs(parsed.query)
+        if parsed.netloc == "join" and query.get("invite"):
+            return f"https://t.me/+{query['invite'][0]}"
+        if parsed.netloc == "resolve" and query.get("domain"):
+            return query["domain"][0]
+        return None
     path = parsed.path.strip("/")
     if parsed.netloc not in ("t.me", "telegram.me"):
         return None
@@ -299,9 +307,16 @@ async def join_one_target(userbot, target):
             return "failed"
         invite_hash = invite_hash_from_target(target)
         if invite_hash:
-            await userbot.invoke(raw.functions.messages.ImportChatInvite(hash=invite_hash))
+            result = await userbot.invoke(raw.functions.messages.ImportChatInvite(hash=invite_hash))
+            joined_chats = list(getattr(result, "chats", []) or [])
+            if not joined_chats:
+                logger.warning("Invite did not return a joined channel: %s", target)
+                return "failed"
         else:
-            await userbot.join_chat(target)
+            joined_chat = await userbot.join_chat(target)
+            if not getattr(joined_chat, "id", None):
+                logger.warning("join_chat did not return a channel for %s", target)
+                return "failed"
         logger.info("Joined force-sub target: %s", target)
         await asyncio.sleep(1)
         return "joined"
@@ -369,8 +384,9 @@ async def join_force_sub_channels(userbot, messages, seen_targets=None, clicked_
         for target in targets:
             if target in seen_targets:
                 continue
-            seen_targets.add(target)
             status = await join_one_target(userbot, target)
+            if status in ("joined", "requested"):
+                seen_targets.add(target)
             if status in results:
                 results[status] += 1
         if looks_like_gate:
@@ -769,25 +785,46 @@ class AutoRepostWorker:
         self.bot = bot
         self.userbot = None
         self.poll_task = None
+        self._lifecycle_lock = asyncio.Lock()
 
     async def start(self):
-        session_string = SESSION_STRING or await get_userbot_session()
-        db_enabled = await get_setting("auto_repost_enabled", False)
-        if not (AUTO_REPOST_ENABLED or db_enabled) or not session_string:
-            logger.info("Auto repost worker disabled. Set SESSION_STRING or add it from admin panel to enable.")
-            return
-        self.userbot = Client(
-            "auto_repost_userbot",
-            api_id=APP_ID,
-            api_hash=API_HASH,
-            session_string=session_string,
-            sleep_threshold=180,
-            in_memory=False,
+        async with self._lifecycle_lock:
+            if self.is_running():
+                return True
+            session_string = SESSION_STRING or await get_userbot_session()
+            db_enabled = await get_auto_repost_enabled()
+            if not (AUTO_REPOST_ENABLED or db_enabled) or not session_string:
+                logger.info("Auto repost worker disabled. Set SESSION_STRING or add it from admin panel to enable.")
+                return False
+            self.userbot = Client(
+                "auto_repost_userbot",
+                api_id=APP_ID,
+                api_hash=API_HASH,
+                session_string=session_string,
+                sleep_threshold=180,
+                in_memory=True,
+            )
+            self.userbot.add_handler(self._handler())
+            try:
+                await self.userbot.start()
+            except Exception:
+                self.userbot = None
+                raise
+            self.poll_task = asyncio.create_task(self._poll_sources())
+            logger.info("Auto repost userbot started.")
+            return True
+
+    def is_running(self):
+        return bool(
+            self.userbot
+            and getattr(self.userbot, "is_connected", False)
+            and self.poll_task
+            and not self.poll_task.done()
         )
-        self.userbot.add_handler(self._handler())
-        await self.userbot.start()
-        self.poll_task = asyncio.create_task(self._poll_sources())
-        logger.info("Auto repost userbot started.")
+
+    async def restart(self):
+        await self.stop()
+        return await self.start()
 
     def _handler(self):
         from pyrogram.handlers import MessageHandler
@@ -959,14 +996,21 @@ class AutoRepostWorker:
             await asyncio.sleep(10)
 
     async def stop(self):
-        if self.poll_task:
-            self.poll_task.cancel()
+        poll_task = self.poll_task
+        self.poll_task = None
+        if poll_task:
+            poll_task.cancel()
             try:
-                await self.poll_task
+                await poll_task
             except asyncio.CancelledError:
                 pass
-        if self.userbot:
-            await self.userbot.stop()
+        userbot = self.userbot
+        self.userbot = None
+        if userbot:
+            try:
+                await userbot.stop()
+            except Exception as exc:
+                logger.warning("Auto repost userbot stop failed: %s", exc)
 
 
 async def run_backfill(bot, limit=50):

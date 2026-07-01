@@ -1,14 +1,22 @@
 #(c) CodeXBotz / Advanced File Share Bot
 
+import asyncio
+
 from pyrogram import Client, filters
 from pyrogram.errors import PhoneCodeExpired, PhoneCodeInvalid, PhoneNumberInvalid, SessionPasswordNeeded, PasswordHashInvalid
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
 
 from bot import Bot
-from admin_fsub_common import is_link_flow_enabled
+from admin_fsub_common import (
+    delete_message_ids_later,
+    edit_markup_message,
+    is_link_flow_enabled,
+    set_link_flow_enabled,
+    send_markup_message,
+)
 from config import ADMINS, APP_ID, API_HASH
 from auto_repost import run_backfill
-from plugins.admin_fsub_panel import render_panel as render_fsub_panel
+from plugins.admin_fsub_panel import render_panel as render_fsub_panel, render_pending_panel
 from database.database import (
     add_channel_pair,
     add_force_sub_channel,
@@ -23,6 +31,10 @@ from database.database import (
     set_setting,
     get_setting,
     get_userbot_session,
+    save_userbot_session,
+    clear_userbot_session,
+    get_auto_repost_enabled,
+    set_auto_repost_enabled,
 )
 
 PENDING_ADMIN_INPUT = {}
@@ -30,42 +42,164 @@ PAIR_DRAFTS = {}
 USERBOT_LOGIN = {}
 
 
+async def validate_userbot_session(session):
+    probe = Client(
+        "validate_userbot_session",
+        api_id=APP_ID,
+        api_hash=API_HASH,
+        session_string=session,
+        in_memory=True,
+        no_updates=True,
+    )
+    try:
+        await asyncio.wait_for(probe.start(), timeout=45)
+        me = await probe.get_me()
+        if getattr(me, "is_bot", False):
+            raise RuntimeError("A user account session is required, not a bot token session")
+    finally:
+        try:
+            await probe.stop()
+        except Exception:
+            pass
+
+
+async def reload_auto_repost_worker(client):
+    worker = getattr(client, "auto_repost_worker", None)
+    if worker is None:
+        raise RuntimeError("Auto-repost worker is unavailable in this bot process")
+    started = await worker.restart()
+    if not started:
+        raise RuntimeError("Worker did not start; check session and auto-repost setting")
+    return worker
+
+
+async def stop_auto_repost_worker(client):
+    worker = getattr(client, "auto_repost_worker", None)
+    if worker is not None:
+        await worker.stop()
+
+
+async def get_userbot_status_details(client):
+    session = await get_userbot_session()
+    worker = getattr(client, "auto_repost_worker", None)
+    running = bool(worker and worker.is_running())
+    user = getattr(getattr(worker, "userbot", None), "me", None) if running else None
+    error = None
+
+    if session and user is None:
+        probe = Client(
+            "userbot_status_probe",
+            api_id=APP_ID,
+            api_hash=API_HASH,
+            session_string=session,
+            in_memory=True,
+            no_updates=True,
+        )
+        try:
+            await asyncio.wait_for(probe.start(), timeout=45)
+            user = await probe.get_me()
+        except Exception as exc:
+            error = str(exc)
+        finally:
+            try:
+                await probe.stop()
+            except Exception:
+                pass
+
+    return {
+        "session": bool(session),
+        "running": running,
+        "user": user,
+        "error": error,
+    }
+
+
 def admin_markup():
-    return InlineKeyboardMarkup(
+    return [
         [
-            [
-                InlineKeyboardButton("🟢 Add Source", callback_data="admin_add_source"),
-                InlineKeyboardButton("🟢 Add Target", callback_data="admin_add_target"),
-            ],
-            [InlineKeyboardButton("🔴 Remove Source/Target", callback_data="admin_remove_pair")],
-            [InlineKeyboardButton("🟢 Add Userbot Session", callback_data="admin_add_session")],
-            [InlineKeyboardButton("🔵 Userbot Status", callback_data="admin_userbot_status")],
-            [InlineKeyboardButton("🔵 Force Subscribe Panel", callback_data="admin_open_fsub")],
-            [InlineKeyboardButton("🔵 View Channel Pairs", callback_data="admin_pairs")],
-            [
-                InlineKeyboardButton("🟢 Start From First", callback_data="admin_start_first"),
-                InlineKeyboardButton("🟢 Start From Latest", callback_data="admin_start_latest"),
-            ],
-            [
-                InlineKeyboardButton("🟢 Interval 30 Min", callback_data="admin_interval_30"),
-                InlineKeyboardButton("🟢 Interval 1 Hour", callback_data="admin_interval_60"),
-            ],
-            [InlineKeyboardButton("🔵 Set Custom Start Post", callback_data="admin_set_start_post")],
-            [InlineKeyboardButton("🟢 Set Custom Interval", callback_data="admin_interval_custom")],
-            [InlineKeyboardButton("🔵 Live Repost Status", callback_data="admin_repost_status")],
-            [InlineKeyboardButton("🟢 Run Backfill Now", callback_data="admin_run_backfill")],
-            [InlineKeyboardButton("🔵 Statistics", callback_data="admin_stats")],
-            [InlineKeyboardButton("🔵 Link Flow Status", callback_data="admin_link_flow_status")],
-            [InlineKeyboardButton("🔵 Bot Settings", callback_data="admin_settings")],
-            [InlineKeyboardButton("🔴 Close", callback_data="close")],
-        ]
+            {"text": "Add Source", "callback_data": "admin_add_source", "style": "success"},
+            {"text": "Add Target", "callback_data": "admin_add_target", "style": "success"},
+        ],
+        [
+            {"text": "Remove Source Target", "callback_data": "admin_remove_pair", "style": "danger"},
+            {"text": "Add Userbot Session", "callback_data": "admin_add_session", "style": "success"},
+        ],
+        [
+            {"text": "Remove Userbot", "callback_data": "admin_remove_session", "style": "danger"},
+            {"text": "Enable Auto Repost", "callback_data": "admin_auto_enable", "style": "success"},
+        ],
+        [
+            {"text": "Disable Auto Repost", "callback_data": "admin_auto_disable", "style": "danger"},
+            {"text": "Userbot Status", "callback_data": "admin_userbot_status", "style": "primary"},
+        ],
+        [
+            {"text": "Force Subscribe Panel", "callback_data": "admin_open_fsub", "style": "primary"},
+            {"text": "View Channel Pairs", "callback_data": "admin_pairs", "style": "primary"},
+        ],
+        [
+            {"text": "Pending Requests", "callback_data": "admin_open_pending", "style": "success"},
+        ],
+        [
+            {"text": "Start From First", "callback_data": "admin_start_first", "style": "success"},
+            {"text": "Start From Latest", "callback_data": "admin_start_latest", "style": "primary"},
+        ],
+        [
+            {"text": "Interval 30 Min", "callback_data": "admin_interval_30", "style": "success"},
+            {"text": "Interval 1 Hour", "callback_data": "admin_interval_60", "style": "success"},
+        ],
+        [
+            {"text": "Set Custom Start Post", "callback_data": "admin_set_start_post", "style": "primary"},
+            {"text": "Set Custom Interval", "callback_data": "admin_interval_custom", "style": "success"},
+        ],
+        [
+            {"text": "Live Repost Status", "callback_data": "admin_repost_status", "style": "primary"},
+            {"text": "Run Backfill Now", "callback_data": "admin_run_backfill", "style": "success"},
+        ],
+        [
+            {"text": "Statistics", "callback_data": "admin_stats", "style": "primary"},
+            {"text": "Link Flow Status", "callback_data": "admin_link_flow_status", "style": "primary"},
+        ],
+        [
+            {"text": "Enable Link Flow", "callback_data": "admin_link_flow_enable", "style": "success"},
+            {"text": "Disable Link Flow", "callback_data": "admin_link_flow_disable", "style": "danger"},
+        ],
+        [
+            {"text": "Set Link", "callback_data": "admin_set_link", "style": "success"},
+            {"text": "Bot Settings", "callback_data": "admin_settings", "style": "primary"},
+        ],
+        [{"text": "Close", "callback_data": "close", "style": "danger"}],
+    ]
+
+
+async def render_admin_panel(target, text="<b>Admin Panel</b>"):
+    rows = admin_markup()
+    if isinstance(target, Message):
+        sent_id = await send_markup_message(
+            target._client,
+            chat_id=target.chat.id,
+            text=text,
+            rows=rows,
+            reply_to_message_id=target.id,
+            disable_web_page_preview=True,
+        )
+        if target.text and target.text.startswith("/admin"):
+            import asyncio
+            asyncio.create_task(delete_message_ids_later(target._client, target.chat.id, [target.id, sent_id], 300))
+        return
+    await edit_markup_message(
+        target._client,
+        chat_id=target.message.chat.id,
+        message_id=target.message.id,
+        text=text,
+        rows=rows,
+        disable_web_page_preview=True,
     )
 
 
 @Bot.on_message(filters.command("admin") & filters.private & filters.user(ADMINS))
 async def admin_panel(client: Client, message: Message):
     PENDING_ADMIN_INPUT.pop(message.from_user.id, None)
-    await message.reply_text("<b>Admin Panel</b>", reply_markup=admin_markup())
+    await render_admin_panel(message)
 
 
 @Bot.on_callback_query(filters.regex("^admin_") & filters.user(ADMINS))
@@ -118,10 +252,47 @@ async def admin_callbacks(client: Client, query: CallbackQuery):
         await query.answer("Send phone number")
         await query.message.reply_text("Send Telegram user account phone number with country code, example: <code>+91XXXXXXXXXX</code>.")
         return
+    elif action == "admin_remove_session":
+        try:
+            await stop_auto_repost_worker(client)
+            await clear_userbot_session(user_id)
+            await query.answer("Userbot removed", show_alert=False)
+            await query.message.reply_text("✅ Userbot session successfully removed. Auto repost is disabled.")
+        except Exception as exc:
+            await query.answer("Remove failed", show_alert=True)
+            await query.message.reply_text(f"❌ Userbot removal failed: <code>{exc}</code>")
+        return
+    elif action == "admin_auto_enable":
+        try:
+            if not await get_userbot_session():
+                raise RuntimeError("Add a valid userbot session first")
+            await set_auto_repost_enabled(True, user_id)
+            await reload_auto_repost_worker(client)
+            await query.answer("Auto repost enabled")
+            await query.message.reply_text("✅ Auto repost successfully enabled and connected.")
+        except Exception as exc:
+            await query.answer("Enable failed", show_alert=True)
+            await query.message.reply_text(f"❌ Auto repost enable failed: <code>{exc}</code>")
+        return
+    elif action == "admin_auto_disable":
+        try:
+            await set_auto_repost_enabled(False, user_id)
+            await stop_auto_repost_worker(client)
+            await query.answer("Auto repost disabled")
+            await query.message.reply_text("✅ Auto repost successfully disabled.")
+        except Exception as exc:
+            await query.answer("Disable failed", show_alert=True)
+            await query.message.reply_text(f"❌ Auto repost disable failed: <code>{exc}</code>")
+        return
     elif action == "admin_open_fsub":
         PENDING_ADMIN_INPUT.pop(user_id, None)
         await query.answer()
         await render_fsub_panel(query, "<b>Force-Subscribe Admin Panel</b>")
+        return
+    elif action == "admin_open_pending":
+        PENDING_ADMIN_INPUT.pop(user_id, None)
+        await query.answer()
+        await render_pending_panel(client, query)
         return
     elif action in ("admin_start_first", "admin_start_latest"):
         mode = "first" if action == "admin_start_first" else "latest"
@@ -157,7 +328,7 @@ async def admin_callbacks(client: Client, query: CallbackQuery):
         return
     elif action == "admin_repost_status":
         session = await get_userbot_session()
-        enabled = await get_setting("auto_repost_enabled", False)
+        enabled = await get_auto_repost_enabled()
         pairs = await list_channel_pairs()
         total_processed = sum(int(p.get("total_posts_processed") or 0) for p in pairs)
         lines = [
@@ -187,27 +358,63 @@ async def admin_callbacks(client: Client, query: CallbackQuery):
             text = "<b>Backfill complete</b>\n" + f"Processed/sent: <code>{result.get('processed', 0)}</code>\n" + "\n".join(result.get("details", []))
         else:
             text = "<b>Backfill failed</b>\n" + f"<code>{result.get('error')}</code>"
-        await query.message.edit_text(text, reply_markup=admin_markup())
+        await render_admin_panel(query, text)
         return
     elif action == "admin_userbot_status":
-        session = await get_userbot_session()
-        enabled = await get_setting("auto_repost_enabled", False)
+        details = await get_userbot_status_details(client)
+        enabled = await get_auto_repost_enabled()
+        user = details["user"]
+        first_name = getattr(user, "first_name", None) or "-"
+        username = getattr(user, "username", None)
+        username = f"@{username}" if username else "-"
+        phone = getattr(user, "phone_number", None) or "-"
         text = "\n".join(
             [
                 "<b>Userbot Status</b>",
-                f"Session: <code>{'Saved' if session else 'Not saved'}</code>",
+                f"Session: <code>{'Active' if details['session'] and user else 'Not active'}</code>",
+                f"Connection: <code>{'Connected' if details['running'] else 'Disconnected'}</code>",
+                f"Phone: <code>{phone}</code>",
+                f"Name: <code>{first_name}</code>",
+                f"Username: <code>{username}</code>",
                 f"Auto repost: <code>{'ON' if enabled else 'OFF'}</code>",
-                "Worker: <code>Check service logs for running state</code>",
+                f"Error: <code>{details['error'] or '-'}</code>",
             ]
         )
     elif action == "admin_link_flow_status":
+        saved_link = await get_setting("amazon_link", "")
         text = "\n".join(
             [
                 "<b>Link Flow Status</b>",
                 f"Gate before deeplink: <code>{'ON' if is_link_flow_enabled() else 'OFF'}</code>",
-                "Use the Force Subscribe Panel to change link-flow behavior.",
+                f"Current link: <code>{saved_link or 'not set'}</code>",
+                "Use buttons below to enable, disable, or set the link.",
             ]
         )
+    elif action == "admin_link_flow_enable":
+        set_link_flow_enabled(True)
+        saved_link = await get_setting("amazon_link", "")
+        text = "\n".join(
+            [
+                "<b>Link Flow Status</b>",
+                f"Gate before deeplink: <code>{'ON' if is_link_flow_enabled() else 'OFF'}</code>",
+                f"Current link: <code>{saved_link or 'not set'}</code>",
+            ]
+        )
+    elif action == "admin_link_flow_disable":
+        set_link_flow_enabled(False)
+        saved_link = await get_setting("amazon_link", "")
+        text = "\n".join(
+            [
+                "<b>Link Flow Status</b>",
+                f"Gate before deeplink: <code>{'ON' if is_link_flow_enabled() else 'OFF'}</code>",
+                f"Current link: <code>{saved_link or 'not set'}</code>",
+            ]
+        )
+    elif action == "admin_set_link":
+        PENDING_ADMIN_INPUT[user_id] = "set_link"
+        await query.answer("Send link")
+        await query.message.reply_text("Send the link you want to save.\nExample:\n<code>https://amzn.to/xxxx</code>")
+        return
     elif action == "admin_pairs":
         pairs = await list_channel_pairs()
         if not pairs:
@@ -234,11 +441,11 @@ async def admin_callbacks(client: Client, query: CallbackQuery):
         )
     else:
         text = "Settings are controlled by environment variables and /setamazon."
-    await query.message.edit_text(text, reply_markup=admin_markup())
+    await render_admin_panel(query, text)
     await query.answer()
 
 
-@Bot.on_message(filters.private & filters.user(ADMINS) & filters.text & ~filters.command(["admin", "fsubadmin", "addchannel", "removechannel", "pausepair", "resumepair", "listchannels", "addforcesub", "removeforcesub", "setamazon", "stats", "broadcast", "users", "start"]))
+@Bot.on_message(filters.private & filters.user(ADMINS) & filters.text & ~filters.command(["admin", "fsubadmin", "addchannel", "removechannel", "pausepair", "resumepair", "listchannels", "addforcesub", "removeforcesub", "setamazon", "stats", "broadcast", "users", "start", "batch", "genlink", "autobatch"]))
 async def admin_pending_input(client: Client, message: Message):
     user_id = message.from_user.id
     action = PENDING_ADMIN_INPUT.get(user_id)
@@ -259,10 +466,11 @@ async def admin_pending_input(client: Client, message: Message):
                 PENDING_ADMIN_INPUT[user_id] = "source"
                 await message.reply_text("Source missing. Send source channel ID first.")
                 return
-            await add_channel_pair(source, target, user_id)
+            if not await add_channel_pair(source, target, user_id):
+                raise RuntimeError("Database did not confirm the source-target pair")
             PENDING_ADMIN_INPUT.pop(user_id, None)
             PAIR_DRAFTS.pop(user_id, None)
-            await message.reply_text(f"Source-target pair added:\n<code>{source}</code> -> <code>{target}</code>", reply_markup=admin_markup())
+            await message.reply_text(f"✅ Source and target successfully added:\n<code>{source}</code> -> <code>{target}</code>")
             return
         if action == "remove_pair":
             parts = text.split()
@@ -271,12 +479,14 @@ async def admin_pending_input(client: Client, message: Message):
                 return
             source = int(parts[0])
             target = int(parts[1]) if len(parts) == 2 else None
-            await remove_channel_pair(source, target)
+            removed = await remove_channel_pair(source, target)
+            if not removed:
+                raise RuntimeError("No matching source/target pair was found")
             PENDING_ADMIN_INPUT.pop(user_id, None)
             if target is None:
-                await message.reply_text(f"Removed all target pairs for source <code>{source}</code>.", reply_markup=admin_markup())
+                await message.reply_text(f"✅ Successfully removed {removed} target pair(s) for source <code>{source}</code>.")
             else:
-                await message.reply_text(f"Removed pair:\n<code>{source}</code> -> <code>{target}</code>", reply_markup=admin_markup())
+                await message.reply_text(f"✅ Source-target pair successfully removed:\n<code>{source}</code> -> <code>{target}</code>")
             return
         if action in ("schedule_first", "schedule_latest"):
             parts = text.split()
@@ -286,7 +496,7 @@ async def admin_pending_input(client: Client, message: Message):
                 )
                 return
             source, target = map(int, parts)
-            mode = action.removeprefix("schedule_")
+            mode = action[len("schedule_"):]
             await configure_channel_pair_schedule(
                 source, target, mode=mode, updated_by=user_id
             )
@@ -295,7 +505,6 @@ async def admin_pending_input(client: Client, message: Message):
                 f"Schedule enabled: <code>{source}</code> -> "
                 f"<code>{target}</code>\n"
                 f"Mode: <code>{mode}</code>",
-                reply_markup=admin_markup(),
             )
             return
         if action in ("interval_30", "interval_60"):
@@ -306,7 +515,7 @@ async def admin_pending_input(client: Client, message: Message):
                 )
                 return
             source, target = map(int, parts)
-            minutes = int(action.removeprefix("interval_"))
+            minutes = int(action[len("interval_"):])
             await configure_channel_pair_schedule(
                 source, target,
                 interval_minutes=minutes,
@@ -315,7 +524,6 @@ async def admin_pending_input(client: Client, message: Message):
             PENDING_ADMIN_INPUT.pop(user_id, None)
             await message.reply_text(
                 f"Posting interval set to <code>{minutes} minutes</code>.",
-                reply_markup=admin_markup(),
             )
             return
         if action == "interval_custom":
@@ -339,7 +547,6 @@ async def admin_pending_input(client: Client, message: Message):
             PENDING_ADMIN_INPUT.pop(user_id, None)
             await message.reply_text(
                 f"Posting interval set to <code>{hours} hour(s)</code>.",
-                reply_markup=admin_markup(),
             )
             return
         if action == "start_post":
@@ -352,7 +559,6 @@ async def admin_pending_input(client: Client, message: Message):
             PENDING_ADMIN_INPUT.pop(user_id, None)
             await message.reply_text(
                 f"Start post saved:\n<code>{source}</code> -> <code>{target}</code> from post <code>{start_id}</code>",
-                reply_markup=admin_markup(),
             )
             return
         if action == "session":
@@ -360,10 +566,16 @@ async def admin_pending_input(client: Client, message: Message):
             if len(session) < 50:
                 await message.reply_text("This does not look like a valid session string. Send again or /admin to cancel.")
                 return
-            await set_setting("session_string", session, user_id)
-            await set_setting("auto_repost_enabled", True, user_id)
+            try:
+                await validate_userbot_session(session)
+            except Exception as exc:
+                await message.reply_text(f"Invalid userbot session: <code>{exc}</code>")
+                return
+            await save_userbot_session(session, user_id)
+            await set_auto_repost_enabled(True, user_id)
+            await reload_auto_repost_worker(client)
             PENDING_ADMIN_INPUT.pop(user_id, None)
-            await message.reply_text("Userbot session saved. Restart service once to start auto-repost worker.", reply_markup=admin_markup())
+            await message.reply_text("✅ Userbot session successfully added. Auto repost is connected and running.")
             return
         if action == "userbot_phone":
             phone = text.replace(" ", "")
@@ -404,11 +616,12 @@ async def admin_pending_input(client: Client, message: Message):
                 return
             session = await user_client.export_session_string()
             await user_client.disconnect()
-            await set_setting("session_string", session, user_id)
-            await set_setting("auto_repost_enabled", True, user_id)
+            await save_userbot_session(session, user_id)
+            await set_auto_repost_enabled(True, user_id)
+            await reload_auto_repost_worker(client)
             USERBOT_LOGIN.pop(user_id, None)
             PENDING_ADMIN_INPUT.pop(user_id, None)
-            await message.reply_text("Userbot login complete. Session saved. Restarting service will enable auto-repost worker.", reply_markup=admin_markup())
+            await message.reply_text("✅ Userbot login successful. Session added and auto repost is running.")
             return
         if action == "userbot_password":
             state = USERBOT_LOGIN.get(user_id)
@@ -424,17 +637,26 @@ async def admin_pending_input(client: Client, message: Message):
                 return
             session = await user_client.export_session_string()
             await user_client.disconnect()
-            await set_setting("session_string", session, user_id)
-            await set_setting("auto_repost_enabled", True, user_id)
+            await save_userbot_session(session, user_id)
+            await set_auto_repost_enabled(True, user_id)
+            await reload_auto_repost_worker(client)
             USERBOT_LOGIN.pop(user_id, None)
             PENDING_ADMIN_INPUT.pop(user_id, None)
-            await message.reply_text("Userbot login complete. Session saved. Restarting service will enable auto-repost worker.", reply_markup=admin_markup())
+            await message.reply_text("✅ Userbot login successful. Session added and auto repost is running.")
+            return
+        if action == "set_link":
+            if not (text.startswith("http://") or text.startswith("https://")):
+                await message.reply_text("Send a valid URL starting with <code>http://</code> or <code>https://</code>.")
+                return
+            await set_setting("amazon_link", text, user_id)
+            PENDING_ADMIN_INPUT.pop(user_id, None)
+            await message.reply_text("✅ Link successfully saved.")
             return
     except ValueError:
         await message.reply_text("Invalid ID. Send a numeric channel ID like <code>-1001234567890</code>.")
     except Exception as exc:
         PENDING_ADMIN_INPUT.pop(user_id, None)
-        await message.reply_text(f"Setup failed: <code>{exc}</code>", reply_markup=admin_markup())
+        await message.reply_text(f"❌ Setup failed: <code>{exc}</code>")
 
 
 @Bot.on_message(filters.command("addchannel") & filters.private & filters.user(ADMINS))
@@ -442,8 +664,16 @@ async def add_channel_cmd(client: Client, message: Message):
     if len(message.command) < 3:
         await message.reply_text("Usage: <code>/addchannel source_id target_id</code>")
         return
-    await add_channel_pair(int(message.command[1]), int(message.command[2]), message.from_user.id)
-    await message.reply_text("Channel pair added.")
+    try:
+        source = int(message.command[1])
+        target = int(message.command[2])
+        if not await add_channel_pair(source, target, message.from_user.id):
+            raise RuntimeError("database did not acknowledge the update")
+        await message.reply_text(
+            f"Source <code>{source}</code> and target <code>{target}</code> successfully added."
+        )
+    except Exception as exc:
+        await message.reply_text(f"Failed to add channel pair: <code>{exc}</code>")
 
 
 @Bot.on_message(filters.command("removechannel") & filters.private & filters.user(ADMINS))
@@ -451,9 +681,18 @@ async def remove_channel_cmd(client: Client, message: Message):
     if len(message.command) < 2:
         await message.reply_text("Usage: <code>/removechannel source_id [target_id]</code>")
         return
-    target = int(message.command[2]) if len(message.command) > 2 else None
-    await remove_channel_pair(int(message.command[1]), target)
-    await message.reply_text("Channel pair removed.")
+    try:
+        source = int(message.command[1])
+        target = int(message.command[2]) if len(message.command) > 2 else None
+        removed = await remove_channel_pair(source, target)
+        if not removed:
+            raise RuntimeError("no matching source/target pair was found")
+        target_text = f" and target <code>{target}</code>" if target is not None else ""
+        await message.reply_text(
+            f"Source <code>{source}</code>{target_text} successfully removed ({removed} pair(s))."
+        )
+    except Exception as exc:
+        await message.reply_text(f"Failed to remove channel pair: <code>{exc}</code>")
 
 
 @Bot.on_message(filters.command(["pausepair", "resumepair"]) & filters.private & filters.user(ADMINS))
@@ -461,9 +700,17 @@ async def toggle_pair_cmd(client: Client, message: Message):
     if len(message.command) < 3:
         await message.reply_text("Usage: <code>/pausepair source_id target_id</code>")
         return
-    active = message.command[0] == "resumepair"
-    await set_channel_pair_active(int(message.command[1]), int(message.command[2]), active)
-    await message.reply_text("Pair updated.")
+    try:
+        source = int(message.command[1])
+        target = int(message.command[2])
+        active = message.command[0] == "resumepair"
+        matched = await set_channel_pair_active(source, target, active)
+        if not matched:
+            raise RuntimeError("no matching source/target pair was found")
+        state = "enabled" if active else "disabled"
+        await message.reply_text(f"Channel pair successfully {state}.")
+    except Exception as exc:
+        await message.reply_text(f"Failed to update channel pair: <code>{exc}</code>")
 
 
 @Bot.on_message(filters.command("listchannels") & filters.private & filters.user(ADMINS))
@@ -484,8 +731,13 @@ async def add_force_cmd(client: Client, message: Message):
     if len(message.command) < 2:
         await message.reply_text("Usage: <code>/addforcesub channel_id</code>")
         return
-    await add_force_sub_channel(int(message.command[1]))
-    await message.reply_text("Force-sub channel added.")
+    try:
+        channel_id = int(message.command[1])
+        if not await add_force_sub_channel(channel_id):
+            raise RuntimeError("database did not acknowledge the update")
+        await message.reply_text(f"Force-sub channel <code>{channel_id}</code> successfully added.")
+    except Exception as exc:
+        await message.reply_text(f"Failed to add force-sub channel: <code>{exc}</code>")
 
 
 @Bot.on_message(filters.command("removeforcesub") & filters.private & filters.user(ADMINS))
@@ -493,17 +745,23 @@ async def remove_force_cmd(client: Client, message: Message):
     if len(message.command) < 2:
         await message.reply_text("Usage: <code>/removeforcesub channel_id</code>")
         return
-    await remove_force_sub_channel(int(message.command[1]))
-    await message.reply_text("Force-sub channel removed.")
+    try:
+        channel_id = int(message.command[1])
+        removed = await remove_force_sub_channel(channel_id)
+        if not removed:
+            raise RuntimeError("channel is not present in force-sub configuration")
+        await message.reply_text(f"Force-sub channel <code>{channel_id}</code> successfully removed.")
+    except Exception as exc:
+        await message.reply_text(f"Failed to remove force-sub channel: <code>{exc}</code>")
 
 
-@Bot.on_message(filters.command("setamazon") & filters.private & filters.user(ADMINS))
+@Bot.on_message(filters.command(["setamazon", "setlink"]) & filters.private & filters.user(ADMINS))
 async def set_amazon_cmd(client: Client, message: Message):
     if len(message.command) < 2:
-        await message.reply_text("Usage: <code>/setamazon https://...</code>")
+        await message.reply_text("Usage: <code>/setlink https://...</code>")
         return
     await set_setting("amazon_link", message.command[1], message.from_user.id)
-    await message.reply_text("Amazon link saved in database. Update AMAZON_LINK env for web app default.")
+    await message.reply_text("Link saved in database.")
 
 
 @Bot.on_message(filters.command("stats") & filters.private & filters.user(ADMINS))

@@ -1,7 +1,10 @@
+import asyncio
+import inspect
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import aiohttp
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.errors import FloodWait
 from pyrogram.errors.exceptions.bad_request_400 import UserNotParticipant
@@ -47,8 +50,9 @@ def _default_store():
     return {
         "enabled": True,
         "link_flow_enabled": True,
-        "request_auto_approve": True,
+        "request_auto_approve": False,
         "channels": [],
+        "join_requests": {},
     }
 
 
@@ -64,6 +68,8 @@ def load_store():
         store.update({k: v for k, v in data.items() if k in store})
     if not isinstance(store["channels"], list):
         store["channels"] = []
+    if not isinstance(store["join_requests"], dict):
+        store["join_requests"] = {}
     return store
 
 
@@ -136,6 +142,14 @@ def get_all_force_sub_entries():
     return list(merged.values())
 
 
+def get_force_sub_entry(channel_id):
+    wanted = _safe_int(channel_id)
+    for entry in get_all_force_sub_entries():
+        if _safe_int(entry.get("channel_id")) == wanted:
+            return entry
+    return None
+
+
 def is_force_sub_globally_enabled():
     return bool(load_store().get("enabled", True))
 
@@ -163,6 +177,39 @@ def get_enabled_force_sub_entries():
     return [entry for entry in get_all_force_sub_entries() if entry.get("enabled", True)]
 
 
+def remember_join_request(channel_id, user_id):
+    channel_id = _safe_int(channel_id)
+    user_id = _safe_int(user_id)
+    if not channel_id or not user_id:
+        return False
+    store = load_store()
+    requests = store.setdefault("join_requests", {})
+    users = requests.setdefault(str(channel_id), {})
+    users[str(user_id)] = _now()
+    save_store(store)
+    return True
+
+
+def has_remembered_join_request(channel_id, user_id):
+    store = load_store()
+    users = store.get("join_requests", {}).get(str(_safe_int(channel_id)), {})
+    return str(_safe_int(user_id)) in users
+
+
+async def has_pending_join_request(client, channel_id, user_id):
+    if has_remembered_join_request(channel_id, user_id):
+        return True
+    try:
+        async for joiner in client.get_chat_join_requests(channel_id, limit=200):
+            user = getattr(joiner, "user", None)
+            if _safe_int(getattr(user, "id", 0)) == _safe_int(user_id):
+                remember_join_request(channel_id, user_id)
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def build_pyrogram_markup(rows):
     return InlineKeyboardMarkup(
         [
@@ -177,6 +224,118 @@ def build_pyrogram_markup(rows):
             for row in rows
         ]
     )
+
+
+def _build_markup_payload(rows, include_style=False):
+    inline_keyboard = []
+    for row in rows:
+        payload_row = []
+        for button in row:
+            item = {"text": button["text"]}
+            if button.get("url"):
+                item["url"] = button["url"]
+            if button.get("callback_data"):
+                item["callback_data"] = button["callback_data"]
+            if include_style and button.get("style"):
+                item["style"] = button["style"]
+            payload_row.append(item)
+        if payload_row:
+            inline_keyboard.append(payload_row)
+    return {"inline_keyboard": inline_keyboard}
+
+
+def _supports_native_button_styles():
+    try:
+        params = inspect.signature(InlineKeyboardButton.__init__).parameters
+    except Exception:
+        return False
+    return "style" in params
+
+
+async def _bot_api_request(method, payload):
+    token = getattr(config, "TG_BOT_TOKEN", "") or ""
+    if not token:
+        raise RuntimeError("TG_BOT_TOKEN missing")
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload, timeout=30) as response:
+            data = await response.json(content_type=None)
+            if response.status != 200 or not data.get("ok"):
+                raise RuntimeError(data.get("description") or f"Bot API {method} failed")
+            return data["result"]
+
+
+async def send_markup_message(
+    client,
+    *,
+    chat_id,
+    text,
+    rows,
+    reply_to_message_id=None,
+    disable_web_page_preview=True,
+):
+    if _supports_native_button_styles():
+        kwargs = {
+            "chat_id": chat_id,
+            "text": text,
+            "reply_markup": build_pyrogram_markup(rows),
+            "disable_web_page_preview": disable_web_page_preview,
+        }
+        if reply_to_message_id:
+            kwargs["reply_to_message_id"] = reply_to_message_id
+        sent = await client.send_message(**kwargs)
+        return getattr(sent, "id", None)
+
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": disable_web_page_preview,
+        "reply_markup": _build_markup_payload(rows, include_style=True),
+    }
+    if reply_to_message_id:
+        payload["reply_to_message_id"] = reply_to_message_id
+        payload["allow_sending_without_reply"] = True
+    result = await _bot_api_request("sendMessage", payload)
+    return result.get("message_id")
+
+
+async def edit_markup_message(
+    client,
+    *,
+    chat_id,
+    message_id,
+    text,
+    rows,
+    disable_web_page_preview=True,
+):
+    if _supports_native_button_styles():
+        await client.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=build_pyrogram_markup(rows),
+            disable_web_page_preview=disable_web_page_preview,
+        )
+        return
+
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": disable_web_page_preview,
+        "reply_markup": _build_markup_payload(rows, include_style=True),
+    }
+    await _bot_api_request("editMessageText", payload)
+
+
+async def delete_message_ids_later(client, chat_id, message_ids, delay=300):
+    try:
+        await asyncio.sleep(delay)
+        await client.delete_messages(chat_id, list(dict.fromkeys(mid for mid in message_ids if mid)))
+    except Exception:
+        pass
 
 
 async def get_client_username(client):
@@ -292,10 +451,16 @@ async def is_user_authorized_for_force_sub(client, user_id):
         try:
             member = await client.get_chat_member(entry["channel_id"], user_id)
         except UserNotParticipant:
+            if entry.get("request_mode") and await has_pending_join_request(client, entry["channel_id"], user_id):
+                continue
             return False
         except Exception:
+            if entry.get("request_mode") and await has_pending_join_request(client, entry["channel_id"], user_id):
+                continue
             return False
         if member.status not in ACTIVE_STATUSES:
+            if entry.get("request_mode") and await has_pending_join_request(client, entry["channel_id"], user_id):
+                continue
             return False
     return True
 
@@ -308,12 +473,18 @@ async def get_missing_force_sub_entries(client, user_id):
         try:
             member = await client.get_chat_member(entry["channel_id"], user_id)
         except UserNotParticipant:
+            if entry.get("request_mode") and await has_pending_join_request(client, entry["channel_id"], user_id):
+                continue
             missing.append(entry)
             continue
         except Exception:
+            if entry.get("request_mode") and await has_pending_join_request(client, entry["channel_id"], user_id):
+                continue
             missing.append(entry)
             continue
         if member.status not in ACTIVE_STATUSES:
+            if entry.get("request_mode") and await has_pending_join_request(client, entry["channel_id"], user_id):
+                continue
             missing.append(entry)
     return missing
 
@@ -336,17 +507,12 @@ def _format_force_message(message, missing_entries):
         text = template.format(**values)
     except Exception:
         text = template
-    if missing_entries:
-        suffix = "\n".join(
-            f"{'Request join' if item.get('request_mode') else 'Join'}: {item.get('title') or item['channel_id']}"
-            for item in missing_entries
-        )
-        text = f"{text}\n\n{suffix}"
     return text
 
 
 async def build_force_sub_rows(client, message, missing_entries):
     rows = []
+    current_row = []
     for entry in missing_entries:
         try:
             title, username, link = await _resolve_join_link(client, entry)
@@ -356,16 +522,18 @@ async def build_force_sub_rows(client, message, missing_entries):
             title = entry.get("title") or str(entry["channel_id"])
             link = None
         if link:
-            label = "Request Join" if entry.get("request_mode") else "Join Channel"
-            rows.append(
-                [
-                    {
-                        "text": f"{label}: {title}",
-                        "url": link,
-                        "style": "primary",
-                    }
-                ]
+            current_row.append(
+                {
+                    "text": "Join Channel",
+                    "url": link,
+                    "style": "primary",
+                }
             )
+            if len(current_row) == 2:
+                rows.append(current_row)
+                current_row = []
+    if current_row:
+        rows.append(current_row)
     bot_username = await get_client_username(client)
     payload = ""
     try:
@@ -383,28 +551,102 @@ async def send_force_sub_gate(client, message):
         return False
     rows = await build_force_sub_rows(client, message, missing_entries)
     text = _format_force_message(message, missing_entries)
-    await message.reply(
+    sent_message_id = await send_markup_message(
+        client,
+        chat_id=message.chat.id,
         text=text,
-        reply_markup=build_pyrogram_markup(rows),
-        quote=True,
+        rows=rows,
+        reply_to_message_id=message.id,
         disable_web_page_preview=True,
     )
+    asyncio.create_task(delete_message_ids_later(client, message.chat.id, [message.id, sent_message_id], 300))
     return True
 
 
 async def handle_join_request(client, join_request):
-    store = load_store()
-    if not store.get("request_auto_approve", True):
-        return
-    chat_id = getattr(join_request.chat, "id", 0)
-    if chat_id not in {_safe_int(item.get("channel_id")) for item in get_enabled_force_sub_entries() if item.get("request_mode")}:
-        return
-    try:
-        await client.approve_chat_join_request(chat_id, join_request.from_user.id)
-    except FloodWait as exc:
-        import asyncio
-        await asyncio.sleep(exc.value)
-        await client.approve_chat_join_request(chat_id, join_request.from_user.id)
+    chat_id = _safe_int(getattr(getattr(join_request, "chat", None), "id", 0))
+    user_id = _safe_int(getattr(getattr(join_request, "from_user", None), "id", 0))
+    request_channels = {
+        _safe_int(item.get("channel_id"))
+        for item in get_all_force_sub_entries()
+        if item.get("request_mode")
+    }
+    if chat_id in request_channels and user_id:
+        remember_join_request(chat_id, user_id)
+    # The request remains pending until an admin explicitly approves it.
+    return False
+
+
+async def approve_all_pending_join_requests(client):
+    total = 0
+    request_channels = [
+        item for item in get_enabled_force_sub_entries()
+        if item.get("request_mode")
+    ]
+    for entry in request_channels:
+        chat_id = entry["channel_id"]
+        async for joiner in client.get_chat_join_requests(chat_id, limit=200):
+            user = getattr(joiner, "user", None)
+            user_id = getattr(user, "id", 0)
+            if not user_id:
+                continue
+            try:
+                await client.approve_chat_join_request(chat_id, user_id)
+                total += 1
+            except FloodWait as exc:
+                import asyncio
+                await asyncio.sleep(exc.value)
+                await client.approve_chat_join_request(chat_id, user_id)
+                total += 1
+            except Exception:
+                continue
+    return total
+
+
+async def get_pending_join_request_counts(client, limit_per_channel=1000):
+    items = []
+    for entry in get_enabled_force_sub_entries():
+        chat_id = entry["channel_id"]
+        title = entry.get("title") or str(chat_id)
+        count = 0
+        try:
+            async for _joiner in client.get_chat_join_requests(chat_id, limit=limit_per_channel):
+                count += 1
+        except Exception:
+            continue
+        items.append(
+            {
+                "channel_id": chat_id,
+                "title": title,
+                "count": count,
+            }
+        )
+    return items
+
+
+async def approve_pending_join_requests_for_channel(client, channel_id, limit_count):
+    channel_id = _safe_int(channel_id)
+    limit_count = max(0, _safe_int(limit_count))
+    if not channel_id or not limit_count:
+        return 0
+    approved = 0
+    async for joiner in client.get_chat_join_requests(channel_id, limit=limit_count):
+        user = getattr(joiner, "user", None)
+        user_id = getattr(user, "id", 0)
+        if not user_id:
+            continue
+        try:
+            await client.approve_chat_join_request(channel_id, user_id)
+            approved += 1
+        except FloodWait as exc:
+            await asyncio.sleep(exc.value)
+            await client.approve_chat_join_request(channel_id, user_id)
+            approved += 1
+        except Exception:
+            continue
+        if approved >= limit_count:
+            break
+    return approved
 
 
 def render_force_sub_list():

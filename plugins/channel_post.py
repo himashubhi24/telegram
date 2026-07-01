@@ -16,10 +16,30 @@ async def _ensure_runtime_attrs(client):
     if not getattr(client, "username", None):
         me = await client.get_me()
         client.username = me.username
-
+# --- safe rollout skip batch collection messages ---
+def _has_pending_batch_collection(message):
+    try:
+        from plugins.link_generator import PENDING_LINK_INPUT
+    except Exception:
+        PENDING_LINK_INPUT = {}
+    try:
+        from plugins.autobatch import is_autobatch_collecting
+    except Exception:
+        is_autobatch_collecting = None
+    user = getattr(message, "from_user", None)
+    if not user:
+        return False
+    state = PENDING_LINK_INPUT.get(user.id) or {}
+    if str(state.get("mode", "")).startswith("batch") or str(state.get("mode", "")) == "single":
+        return True
+    if is_autobatch_collecting and is_autobatch_collecting(user.id):
+        return True
+    return False
 
 @Bot.on_message(filters.private & filters.user(ADMINS) & ~filters.command(['start','users','broadcast','batch','genlink','stats']))
 async def channel_post(client: Client, message: Message):
+    if _has_pending_batch_collection(message):
+        return
     reply_text = await message.reply_text("Please Wait...!", quote = True)
     await _ensure_runtime_attrs(client)
     try:

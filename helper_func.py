@@ -87,7 +87,9 @@ async def get_messages(client, message_ids):
                 message_ids=temb_ids
             )
         except FloodWait as e:
-            await asyncio.sleep(e.x)
+            delay = getattr(e, "value", getattr(e, "x", 0))
+            if delay:
+                await asyncio.sleep(delay)
             msgs = await client.get_messages(
                 chat_id=client.db_channel.id,
                 message_ids=temb_ids
