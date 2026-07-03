@@ -15,6 +15,11 @@ from config import ADMINS, OWNER_ID, FORCE_MSG, START_MSG, CUSTOM_CAPTION, DISAB
 from helper_func import subscribed, encode, decode, get_messages
 from database.database import add_user, del_user, full_userbase, present_user
 
+try:
+    from admin_fsub_common import send_force_sub_gate as _dynamic_send_force_sub_gate
+except Exception:
+    _dynamic_send_force_sub_gate = None
+
 
 
 
@@ -120,6 +125,13 @@ REPLY_ERROR = """<code>Use this command as a reply to any telegram message with 
     
 @Bot.on_message(filters.command('start') & filters.private)
 async def not_joined(client: Client, message: Message):
+
+    if _dynamic_send_force_sub_gate is not None:
+        try:
+            if await _dynamic_send_force_sub_gate(client, message):
+                return
+        except Exception as exc:
+            print(f"Dynamic force-sub gate failed: {exc}")
     buttons = [
         [
             InlineKeyboardButton(text="Join Channel", url=client.invitelink),

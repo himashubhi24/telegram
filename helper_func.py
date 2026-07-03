@@ -147,5 +147,24 @@ def get_readable_time(seconds: int) -> str:
     return up_time
 
 
+
+# Dynamic force-sub wrapper: keeps original /start/media flow intact,
+# but lets admin_fsub_common decide whether /start should be gated.
+try:
+    from admin_fsub_common import is_user_authorized_for_force_sub as _dynamic_force_sub_check
+except Exception:
+    _dynamic_force_sub_check = None
+
+if _dynamic_force_sub_check is not None:
+    async def is_subscribed(filter, client, update):
+        try:
+            user = getattr(update, "from_user", None)
+            if not user:
+                return True
+            return await _dynamic_force_sub_check(client, user.id)
+        except Exception as exc:
+            print(f"Dynamic force-sub check failed: {exc}")
+            return True
+
 subscribed = filters.create(is_subscribed)
        
